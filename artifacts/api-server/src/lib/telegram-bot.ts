@@ -54,6 +54,21 @@ const SEND_DELAY_MS = 40;
 const RADAR_MAP_REQUEST_TIMEOUT_MS = 10_000;
 const RADAR_SIGNATURE_PATTERN =
   /\s*📡\s*Локатор России\s*[-–—]\s*@locatorru\s*$/iu;
+const TELEGRAM_COMMANDS = [
+  {
+    command: "start",
+    description: "Подписаться на новые сообщения",
+  },
+  { command: "stop", description: "Отписаться от рассылки" },
+  { command: "help", description: "Показать список команд" },
+  { command: "commands", description: "Показать список команд" },
+];
+const COMMANDS_TEXT =
+  "Доступные команды:\n" +
+  "/start — подписаться на новые сообщения\n" +
+  "/stop — отписаться от рассылки\n" +
+  "/help — показать этот список\n" +
+  "/commands — показать этот список";
 
 function readTelegramToken(): string | undefined {
   for (const name of [
@@ -149,6 +164,10 @@ function escapeTelegramHtml(value: string): string {
 
 function removeRadarSignature(text: string): string {
   return text.replace(RADAR_SIGNATURE_PATTERN, "").trim();
+}
+
+function normalizeCommand(text: string): string {
+  return text.trim().split(/\s+/, 1)[0].toLowerCase().split("@", 1)[0];
 }
 
 function formatRadarMapMessage(message: RadarMapMessage): string {
@@ -323,6 +342,13 @@ export function startTelegramBot() {
         { botUsername: bot.username, radarMapApiUrl: options.radarMapApiUrl },
         "Telegram subscriber bot started",
       );
+      try {
+        await callTelegramApi(options, "setMyCommands", {
+          commands: TELEGRAM_COMMANDS,
+        });
+      } catch (error) {
+        logger.warn({ err: error }, "Could not set Telegram command menu");
+      }
     } catch (error) {
       logger.error({ err: error }, "Telegram bot could not start");
       return;
@@ -350,7 +376,7 @@ export function startTelegramBot() {
             continue;
           }
 
-          const command = message.text.trim().split(/\s+/, 1)[0].toLowerCase();
+          const command = normalizeCommand(message.text);
 
           if (command === "/start") {
             await subscribeUser(message);
@@ -364,6 +390,11 @@ export function startTelegramBot() {
             await callTelegramApi(options, "sendMessage", {
               chat_id: message.chat.id,
               text: "Вы отписаны от рассылки.",
+            });
+          } else if (command === "/help" || command === "/commands") {
+            await callTelegramApi(options, "sendMessage", {
+              chat_id: message.chat.id,
+              text: COMMANDS_TEXT,
             });
           }
         }

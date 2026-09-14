@@ -40,6 +40,22 @@ RADAR_SIGNATURE_PATTERN = re.compile(
     r"\s*📡\s*Локатор России\s*[-–—]\s*@locatorru\s*$",
     re.IGNORECASE,
 )
+TELEGRAM_COMMANDS = [
+    {
+        "command": "start",
+        "description": "Подписаться на новые сообщения",
+    },
+    {"command": "stop", "description": "Отписаться от рассылки"},
+    {"command": "help", "description": "Показать список команд"},
+    {"command": "commands", "description": "Показать список команд"},
+]
+COMMANDS_TEXT = (
+    "Доступные команды:\n"
+    "/start — подписаться на новые сообщения\n"
+    "/stop — отписаться от рассылки\n"
+    "/help — показать этот список\n"
+    "/commands — показать этот список"
+)
 FILE_LOCK = threading.Lock()
 STOP_EVENT = threading.Event()
 
@@ -297,11 +313,24 @@ def send_command(chat_id: int, text: str) -> None:
     telegram("sendMessage", {"chat_id": chat_id, "text": text})
 
 
+def normalize_command(text: str) -> str:
+    command = text.strip().split(maxsplit=1)[0].lower()
+    return command.split("@", maxsplit=1)[0]
+
+
+def register_telegram_commands() -> None:
+    try:
+        telegram("setMyCommands", {"commands": TELEGRAM_COMMANDS})
+    except Exception as error:
+        print("Не удалось установить меню команд:", error, flush=True)
+
+
 def telegram_loop() -> None:
     update_offset = 0
     telegram("deleteWebhook", {"drop_pending_updates": False})
     bot = telegram("getMe")
     print(f"Бот @{bot.get('username', 'без_username')} запущен.", flush=True)
+    register_telegram_commands()
 
     while not STOP_EVENT.is_set():
         try:
@@ -321,7 +350,7 @@ def telegram_loop() -> None:
                 if chat.get("type") != "private" or not text:
                     continue
 
-                command = text.strip().split()[0].lower()
+                command = normalize_command(text)
                 if command == "/start":
                     subscribe(message)
                     send_command(
@@ -332,11 +361,8 @@ def telegram_loop() -> None:
                 elif command == "/stop":
                     unsubscribe(chat["id"])
                     send_command(chat["id"], "Вы отписаны от рассылки.")
-                elif command == "/help":
-                    send_command(
-                        chat["id"],
-                        "Команды:\n/start — подписаться\n/stop — отписаться",
-                    )
+                elif command in {"/help", "/commands"}:
+                    send_command(chat["id"], COMMANDS_TEXT)
         except Exception as error:
             if not STOP_EVENT.is_set():
                 print("Ошибка Telegram polling:", error, flush=True)

@@ -17,6 +17,18 @@ const RETRY_DELAY_MS = 5_000;
 const SEND_DELAY_MS = 40;
 const RADAR_SIGNATURE_PATTERN =
   /\s*📡\s*Локатор России\s*[-–—]\s*@locatorru\s*$/iu;
+const TELEGRAM_COMMANDS = [
+  { command: "start", description: "Подписаться на новые сообщения" },
+  { command: "stop", description: "Отписаться от рассылки" },
+  { command: "help", description: "Показать список команд" },
+  { command: "commands", description: "Показать список команд" },
+];
+const COMMANDS_TEXT =
+  "Доступные команды:\n" +
+  "/start — подписаться на новые сообщения\n" +
+  "/stop — отписаться от рассылки\n" +
+  "/help — показать этот список\n" +
+  "/commands — показать этот список";
 
 const token =
   process.env.TELEGRAM_BOT_TOKEN?.trim() ||
@@ -60,6 +72,10 @@ function radarMessageKey(message) {
 
 function removeRadarSignature(text) {
   return text.replace(RADAR_SIGNATURE_PATTERN, "").trim();
+}
+
+function normalizeCommand(text) {
+  return text.trim().split(/\s+/, 1)[0].toLowerCase().split("@", 1)[0];
 }
 
 function formatRadarMessage(message) {
@@ -239,6 +255,11 @@ async function telegramLoop() {
   await telegram("deleteWebhook", { drop_pending_updates: false });
   const bot = await telegram("getMe");
   console.log(`Бот @${bot.username || "без_username"} запущен.`);
+  try {
+    await telegram("setMyCommands", { commands: TELEGRAM_COMMANDS });
+  } catch (error) {
+    console.warn("Не удалось установить меню команд:", error.message);
+  }
 
   while (!stopped) {
     try {
@@ -253,7 +274,7 @@ async function telegramLoop() {
         const message = update.message;
         if (message?.chat?.type !== "private" || !message.text) continue;
 
-        const command = message.text.trim().split(/\s+/, 1)[0].toLowerCase();
+        const command = normalizeCommand(message.text);
         if (command === "/start") {
           await subscribe(message);
           await telegram("sendMessage", {
@@ -267,11 +288,10 @@ async function telegramLoop() {
             chat_id: message.chat.id,
             text: "Вы отписаны от рассылки.",
           });
-        } else if (command === "/help") {
+        } else if (command === "/help" || command === "/commands") {
           await telegram("sendMessage", {
             chat_id: message.chat.id,
-            text:
-              "Команды:\n/start — подписаться\n/stop — отписаться",
+            text: COMMANDS_TEXT,
           });
         }
       }
