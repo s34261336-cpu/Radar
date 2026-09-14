@@ -53,12 +53,20 @@ const RETRY_DELAY_MS = 5_000;
 const SEND_DELAY_MS = 40;
 const RADAR_MAP_REQUEST_TIMEOUT_MS = 10_000;
 
-function readRequiredEnv(name: string): string {
-  const value = process.env[name]?.trim();
-  if (!value) {
-    throw new Error(`${name} environment variable is required.`);
+function readTelegramToken(): string | undefined {
+  for (const name of [
+    "TELEGRAM_BOT_TOKEN",
+    "BOT_TOKEN",
+    "TELEGRAM_TOKEN",
+    "TOKEN",
+  ]) {
+    const value = process.env[name]?.trim();
+    if (value) {
+      return value;
+    }
   }
-  return value;
+
+  return undefined;
 }
 
 function readPositiveIntEnv(name: string, fallback: number): number {
@@ -270,8 +278,16 @@ async function runRadarMapPoller(
 }
 
 export function startTelegramBot() {
+  const token = readTelegramToken();
+  if (!token) {
+    logger.warn(
+      "No Telegram bot token configured; Telegram subscriber bot is disabled",
+    );
+    return { stop: () => undefined };
+  }
+
   const options: TelegramBotOptions = {
-    token: readRequiredEnv("TELEGRAM_BOT_TOKEN"),
+    token,
     radarMapApiUrl:
       process.env["RADAR_MAP_API_URL"]?.trim() || DEFAULT_RADAR_MAP_API_URL,
     radarMapPollIntervalMs: readPositiveIntEnv(
