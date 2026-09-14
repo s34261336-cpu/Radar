@@ -22,8 +22,8 @@ timeoutMs = 20000
 [userenv]
 
 [userenv.shared]
-TELEGRAM_DESTINATION_CHAT = "@radarrussiia"
-TELEGRAM_SOURCE_CHAT = "@radarrussiia"
+RADAR_MAP_API_URL = "https://radar-map.ru/api/state"
+RADAR_MAP_POLL_INTERVAL_MS = "15000"
 
 [nix]
 channel = "stable-25_05"

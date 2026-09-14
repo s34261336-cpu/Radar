@@ -9,11 +9,6 @@ type TelegramChat = {
   first_name?: string;
 };
 
-type TelegramChannelPost = {
-  message_id: number;
-  chat: TelegramChat;
-};
-
 type TelegramMessage = {
   chat: TelegramChat;
   text?: string;
@@ -22,8 +17,21 @@ type TelegramMessage = {
 
 type TelegramUpdate = {
   update_id: number;
-  channel_post?: TelegramChannelPost;
   message?: TelegramMessage;
+};
+
+type RadarMapMessage = {
+  msg_id?: string | number;
+  text?: string;
+  ts?: number;
+  time_label?: string;
+  source_id?: string;
+  source_label?: string;
+  channel?: string;
+};
+
+type RadarMapState = {
+  recent_messages?: RadarMapMessage[];
 };
 
 type TelegramApiResponse<T> = {
@@ -34,13 +42,16 @@ type TelegramApiResponse<T> = {
 
 type TelegramBotOptions = {
   token: string;
-  sourceChat: string;
+  radarMapApiUrl: string;
+  radarMapPollIntervalMs: number;
 };
 
 const API_BASE_URL = "https://api.telegram.org";
+const DEFAULT_RADAR_MAP_API_URL = "https://radar-map.ru/api/state";
 const POLL_TIMEOUT_SECONDS = 25;
 const RETRY_DELAY_MS = 5_000;
 const SEND_DELAY_MS = 40;
+const RADAR_MAP_REQUEST_TIMEOUT_MS = 10_000;
 
 function readRequiredEnv(name: string): string {
   const value = process.env[name]?.trim();
@@ -50,12 +61,9 @@ function readRequiredEnv(name: string): string {
   return value;
 }
 
-function chatMatches(chat: TelegramChat, configuredChat: string): boolean {
-  if (configuredChat.startsWith("@")) {
-    return chat.username?.toLowerCase() === configuredChat.slice(1).toLowerCase();
-  }
-
-  return String(chat.id) === configuredChat;
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const value = Number(process.env[name]);
+  return Number.isInteger(value) && value > 0 ? value : fallback;
 }
 
 async function subscribeUser(message: TelegramMessage): Promise<void> {
@@ -77,7 +85,7 @@ async function subscribeUser(message: TelegramMessage): Promise<void> {
     });
 }
 
-async function unsubscribeUser(chatId: number): Promise<void> {
+async function unsubscribeUser(chatId: string | number): Promise<void> {
   await db
     .delete(telegramSubscribers)
     .where(eq(telegramSubscribers.chatId, String(chatId)));
@@ -88,37 +96,191 @@ async function callTelegramApi<T>(
   method: string,
   body: Record<string, unknown> = {},
 ): Promise<T> {
-  const response = await fetch(
-    `${API_BASE_URL}/bot${options.token}/${method}`,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify(body),
-    },
-  );
+  const response = await fetch(`${API_BASE_URL}/bot${options.token}/${method}`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
 
   let payload: TelegramApiResponse<T>;
   try {
     payload = (await response.json()) as TelegramApiResponse<T>;
   } catch (error) {
     throw new Error(
-      `Telegram API returned invalid JSON: ${error instanceof Error ? error.message : "unknown error"}`,
+      `Telegram API returned invalid JSON: ${
+        error instanceof Error ? error.message : "unknown error"
+      }`,
     );
   }
 
   if (!response.ok || !payload.ok || payload.result === undefined) {
     throw new Error(
-      `Telegram API ${method} failed: ${payload.description ?? `HTTP ${response.status}`}`,
+      `Telegram API ${method} failed: ${
+        payload.description ?? `HTTP ${response.status}`
+      }`,
     );
   }
 
   return payload.result;
 }
 
+function radarMessageKey(message: RadarMapMessage): string {
+  const source = message.source_id ?? message.channel ?? "radar-map";
+  const id = message.msg_id ?? `${message.ts ?? 0}:${message.text ?? ""}`;
+  return `${source}:${id}`;
+}
+
+function formatRadarMapMessage(message: RadarMapMessage): string {
+  const lines = ["RadarMap"];
+
+  if (message.time_label) {
+    lines.push(message.time_label);
+  }
+  if (message.text) {
+    lines.push(message.text);
+  }
+
+  lines.push(
+    "",
+    `Источник: ${message.source_label ?? message.source_id ?? "RadarMap"}`,
+    "https://radar-map.ru/",
+  );
+
+  return lines.join("\n");
+}
+
+async function fetchRadarMapState(
+  apiUrl: string,
+): Promise<RadarMapMessage[]> {
+  const response = await fetch(apiUrl, {
+    headers: { accept: "application/json" },
+    signal: AbortSignal.timeout(RADAR_MAP_REQUEST_TIMEOUT_MS),
+  });
+
+  if (!response.ok) {
+    throw new Error(`RadarMap API returned HTTP ${response.status}`);
+  }
+
+  const state = (await response.json()) as RadarMapState;
+  if (!Array.isArray(state.recent_messages)) {
+    throw new Error("RadarMap API response has no recent_messages array");
+  }
+
+  return state.recent_messages.filter(
+    (message): message is RadarMapMessage =>
+      typeof message === "object" &&
+      message !== null &&
+      (typeof message.msg_id === "string" ||
+        typeof message.msg_id === "number" ||
+        typeof message.text === "string"),
+  );
+}
+
+async function deliverToSubscribers(
+  options: TelegramBotOptions,
+  text: string,
+): Promise<number> {
+  const subscribers = await db.select().from(telegramSubscribers);
+  let delivered = 0;
+
+  for (const subscriber of subscribers) {
+    try {
+      await callTelegramApi(options, "sendMessage", {
+        chat_id: subscriber.chatId,
+        text,
+        disable_web_page_preview: true,
+      });
+      delivered += 1;
+    } catch (error) {
+      const description = error instanceof Error ? error.message : "";
+      if (
+        description.includes("bot was blocked by the user") ||
+        description.includes("chat not found")
+      ) {
+        await unsubscribeUser(subscriber.chatId);
+      }
+      logger.warn(
+        { err: error },
+        "RadarMap message could not be delivered to a subscriber",
+      );
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, SEND_DELAY_MS));
+  }
+
+  return delivered;
+}
+
+async function runRadarMapPoller(
+  options: TelegramBotOptions,
+  isStopped: () => boolean,
+): Promise<void> {
+  const knownKeys = new Set<string>();
+  let initialized = false;
+
+  while (!isStopped()) {
+    try {
+      const messages = await fetchRadarMapState(options.radarMapApiUrl);
+      const freshMessages = messages
+        .filter((message) => !knownKeys.has(radarMessageKey(message)))
+        .sort((left, right) => (left.ts ?? 0) - (right.ts ?? 0));
+
+      if (!initialized) {
+        for (const message of messages) {
+          knownKeys.add(radarMessageKey(message));
+        }
+        initialized = true;
+        logger.info(
+          { messageCount: messages.length, apiUrl: options.radarMapApiUrl },
+          "RadarMap source connected",
+        );
+      } else {
+        for (const message of freshMessages) {
+          const delivered = await deliverToSubscribers(
+            options,
+            formatRadarMapMessage(message),
+          );
+          logger.info(
+            {
+              messageId: message.msg_id,
+              source: message.source_label ?? message.source_id,
+              delivered,
+            },
+            "RadarMap message delivered",
+          );
+          knownKeys.add(radarMessageKey(message));
+        }
+      }
+
+      while (knownKeys.size > 5_000) {
+        const oldestKey = knownKeys.values().next().value;
+        if (oldestKey === undefined) {
+          break;
+        }
+        knownKeys.delete(oldestKey);
+      }
+
+      await new Promise((resolve) =>
+        setTimeout(resolve, options.radarMapPollIntervalMs),
+      );
+    } catch (error) {
+      if (!isStopped()) {
+        logger.error({ err: error }, "RadarMap polling error; retrying");
+        await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+      }
+    }
+  }
+}
+
 export function startTelegramBot() {
   const options: TelegramBotOptions = {
     token: readRequiredEnv("TELEGRAM_BOT_TOKEN"),
-    sourceChat: process.env["TELEGRAM_SOURCE_CHAT"]?.trim() || "@radarrussiia",
+    radarMapApiUrl:
+      process.env["RADAR_MAP_API_URL"]?.trim() || DEFAULT_RADAR_MAP_API_URL,
+    radarMapPollIntervalMs: readPositiveIntEnv(
+      "RADAR_MAP_POLL_INTERVAL_MS",
+      15_000,
+    ),
   };
 
   let stopped = false;
@@ -138,13 +300,15 @@ export function startTelegramBot() {
         "getMe",
       );
       logger.info(
-        { botUsername: bot.username, sourceChat: options.sourceChat },
-        "Telegram copy bot started",
+        { botUsername: bot.username, radarMapApiUrl: options.radarMapApiUrl },
+        "Telegram subscriber bot started",
       );
     } catch (error) {
       logger.error({ err: error }, "Telegram bot could not start");
       return;
     }
+
+    void runRadarMapPoller(options, () => stopped);
 
     while (!stopped) {
       try {
@@ -154,7 +318,7 @@ export function startTelegramBot() {
           {
             offset,
             timeout: POLL_TIMEOUT_SECONDS,
-            allowed_updates: ["channel_post", "message"],
+            allowed_updates: ["message"],
           },
         );
 
@@ -162,68 +326,26 @@ export function startTelegramBot() {
           offset = update.update_id + 1;
           const message = update.message;
 
-          if (message?.chat.type === "private" && message.text) {
-            const command = message.text.trim().split(/\s+/, 1)[0].toLowerCase();
-
-            if (command === "/start") {
-              await subscribeUser(message);
-              await callTelegramApi(options, "sendMessage", {
-                chat_id: message.chat.id,
-                text:
-                  "Вы подписаны. Я буду присылать новые публикации из канала @radarrussiia.",
-              });
-            } else if (command === "/stop") {
-              await unsubscribeUser(message.chat.id);
-              await callTelegramApi(options, "sendMessage", {
-                chat_id: message.chat.id,
-                text: "Вы отписаны от рассылки.",
-              });
-            }
-          }
-
-          const post = update.channel_post;
-
-          if (!post || !chatMatches(post.chat, options.sourceChat)) {
+          if (message?.chat.type !== "private" || !message.text) {
             continue;
           }
 
-          const subscribers = await db.select().from(telegramSubscribers);
-          let delivered = 0;
+          const command = message.text.trim().split(/\s+/, 1)[0].toLowerCase();
 
-          for (const subscriber of subscribers) {
-            try {
-              await callTelegramApi(options, "copyMessage", {
-                chat_id: subscriber.chatId,
-                from_chat_id: post.chat.id,
-                message_id: post.message_id,
-              });
-              delivered += 1;
-            } catch (error) {
-              const description = error instanceof Error ? error.message : "";
-              if (
-                description.includes("bot was blocked by the user") ||
-                description.includes("chat not found")
-              ) {
-                await unsubscribeUser(Number(subscriber.chatId));
-              }
-              logger.warn(
-                { err: error },
-                "Telegram post could not be delivered to a subscriber",
-              );
-            }
-
-            await new Promise((resolve) => setTimeout(resolve, SEND_DELAY_MS));
+          if (command === "/start") {
+            await subscribeUser(message);
+            await callTelegramApi(options, "sendMessage", {
+              chat_id: message.chat.id,
+              text:
+                "Вы подписаны. Я буду присылать новые сообщения с RadarMap.",
+            });
+          } else if (command === "/stop") {
+            await unsubscribeUser(message.chat.id);
+            await callTelegramApi(options, "sendMessage", {
+              chat_id: message.chat.id,
+              text: "Вы отписаны от рассылки.",
+            });
           }
-
-          logger.info(
-            {
-              sourceChat: options.sourceChat,
-              messageId: post.message_id,
-              subscriberCount: subscribers.length,
-              delivered,
-            },
-            "Telegram channel post delivered",
-          );
         }
       } catch (error) {
         if (!stopped) {
@@ -233,7 +355,7 @@ export function startTelegramBot() {
       }
     }
 
-    logger.info("Telegram copy bot stopped");
+    logger.info("Telegram subscriber bot stopped");
   };
 
   void run();
