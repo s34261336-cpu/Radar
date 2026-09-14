@@ -130,23 +130,19 @@ function radarMessageKey(message: RadarMapMessage): string {
   return `${source}:${id}`;
 }
 
+function escapeTelegramHtml(value: string): string {
+  return value
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;");
+}
+
 function formatRadarMapMessage(message: RadarMapMessage): string {
-  const lines = ["RadarMap"];
+  const time = message.time_label
+    ? `<b>${escapeTelegramHtml(message.time_label)}</b>\n\n`
+    : "";
 
-  if (message.time_label) {
-    lines.push(message.time_label);
-  }
-  if (message.text) {
-    lines.push(message.text);
-  }
-
-  lines.push(
-    "",
-    `Источник: ${message.source_label ?? message.source_id ?? "RadarMap"}`,
-    "https://radar-map.ru/",
-  );
-
-  return lines.join("\n");
+  return `${time}${escapeTelegramHtml(message.text?.trim() ?? "")}`.trim();
 }
 
 async function fetchRadarMapState(
@@ -188,6 +184,7 @@ async function deliverToSubscribers(
       await callTelegramApi(options, "sendMessage", {
         chat_id: subscriber.chatId,
         text,
+        parse_mode: "HTML",
         disable_web_page_preview: true,
       });
       delivered += 1;
