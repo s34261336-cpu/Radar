@@ -52,6 +52,8 @@ const POLL_TIMEOUT_SECONDS = 25;
 const RETRY_DELAY_MS = 5_000;
 const SEND_DELAY_MS = 40;
 const RADAR_MAP_REQUEST_TIMEOUT_MS = 10_000;
+const RADAR_SIGNATURE_PATTERN =
+  /\s*📡\s*Локатор России\s*[-–—]\s*@locatorru\s*$/iu;
 
 function readTelegramToken(): string | undefined {
   for (const name of [
@@ -145,12 +147,17 @@ function escapeTelegramHtml(value: string): string {
     .replaceAll(">", "&gt;");
 }
 
+function removeRadarSignature(text: string): string {
+  return text.replace(RADAR_SIGNATURE_PATTERN, "").trim();
+}
+
 function formatRadarMapMessage(message: RadarMapMessage): string {
   const time = message.time_label
     ? `<b>${escapeTelegramHtml(message.time_label)}</b>\n\n`
     : "";
+  const text = removeRadarSignature(message.text?.trim() ?? "");
 
-  return `${time}${escapeTelegramHtml(message.text?.trim() ?? "")}`.trim();
+  return `${time}${escapeTelegramHtml(text)}`.trim();
 }
 
 async function fetchRadarMapState(

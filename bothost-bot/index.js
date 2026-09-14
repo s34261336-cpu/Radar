@@ -15,6 +15,8 @@ const POLL_INTERVAL_MS = readPositiveNumber(
 const TELEGRAM_POLL_TIMEOUT_SECONDS = 25;
 const RETRY_DELAY_MS = 5_000;
 const SEND_DELAY_MS = 40;
+const RADAR_SIGNATURE_PATTERN =
+  /\s*📡\s*Локатор России\s*[-–—]\s*@locatorru\s*$/iu;
 
 const token =
   process.env.TELEGRAM_BOT_TOKEN?.trim() ||
@@ -56,11 +58,16 @@ function radarMessageKey(message) {
   return `${source}:${id}`;
 }
 
+function removeRadarSignature(text) {
+  return text.replace(RADAR_SIGNATURE_PATTERN, "").trim();
+}
+
 function formatRadarMessage(message) {
   const time = message.time_label
     ? `<b>${escapeHtml(message.time_label)}</b>\n\n`
     : "";
-  return `${time}${escapeHtml((message.text || "").trim())}`.trim();
+  const text = removeRadarSignature((message.text || "").trim());
+  return `${time}${escapeHtml(text)}`.trim();
 }
 
 async function telegram(method, body = {}) {
