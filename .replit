@@ -1,4 +1,4 @@
-modules = ["nodejs-24"]
+modules = ["nodejs-24", "postgresql-16"]
 
 [deployment]
 router = "application"
@@ -24,3 +24,6 @@ timeoutMs = 20000
 [userenv.shared]
 TELEGRAM_DESTINATION_CHAT = "@radarrussiia"
 TELEGRAM_SOURCE_CHAT = "@radarrussiia"
+
+[nix]
+channel = "stable-25_05"
