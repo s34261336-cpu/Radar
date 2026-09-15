@@ -12,6 +12,10 @@ const POLL_INTERVAL_MS = readPositiveNumber(
   process.env.RADAR_MAP_POLL_INTERVAL_MS,
   15_000,
 );
+const DUPLICATE_WINDOW_MS = readPositiveNumber(
+  process.env.RADAR_DUPLICATE_WINDOW_MS,
+  30 * 60 * 1000,
+);
 const TELEGRAM_POLL_TIMEOUT_SECONDS = 25;
 const RETRY_DELAY_MS = 5_000;
 const SEND_DELAY_MS = 40;
@@ -72,6 +76,53 @@ function radarMessageKey(message) {
 
 function removeRadarSignature(text) {
   return text.replace(RADAR_SIGNATURE_PATTERN, "").trim();
+}
+
+function normalizeRadarText(text) {
+  return removeRadarSignature(text)
+    .toLowerCase()
+    .replaceAll("ё", "е")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function areNearDuplicateTexts(left, right) {
+  if (left === right) return true;
+  if (left.length < 24 || right.length < 24) return false;
+
+  const leftWords = new Set(left.split(" "));
+  const rightWords = new Set(right.split(" "));
+  const union = new Set([...leftWords, ...rightWords]);
+  const intersection = [...leftWords].filter((word) =>
+    rightWords.has(word),
+  );
+  const lengthRatio =
+    Math.min(left.length, right.length) / Math.max(left.length, right.length);
+
+  return intersection.length / union.size >= 0.85 && lengthRatio >= 0.75;
+}
+
+function isRecentRadarDuplicate(text, recentTexts, now) {
+  const normalizedText = normalizeRadarText(text);
+  if (!normalizedText) return false;
+
+  for (let index = recentTexts.length - 1; index >= 0; index -= 1) {
+    if (now - recentTexts[index].seenAt > DUPLICATE_WINDOW_MS) {
+      recentTexts.splice(index, 1);
+    }
+  }
+
+  return recentTexts.some((entry) =>
+    areNearDuplicateTexts(entry.normalizedText, normalizedText),
+  );
+}
+
+function rememberRadarText(text, recentTexts, now) {
+  const normalizedText = normalizeRadarText(text);
+  if (normalizedText) {
+    recentTexts.push({ normalizedText, seenAt: now });
+  }
 }
 
 function normalizeCommand(text) {
@@ -211,6 +262,8 @@ async function fetchRadarMapMessages() {
 }
 
 async function radarMapLoop() {
+  const recentRadarTexts = [];
+
   while (!stopped) {
     try {
       const messages = await fetchRadarMapMessages();
@@ -224,9 +277,18 @@ async function radarMapLoop() {
         console.log(`RadarMap подключён. Событий в снимке: ${messages.length}.`);
       } else {
         for (const message of freshMessages) {
+          const rawText = message.text || "";
+          const now = Date.now();
+          if (isRecentRadarDuplicate(rawText, recentRadarTexts, now)) {
+            console.log("Похожее событие RadarMap пропущено как повторное.");
+            knownRadarMessages.add(radarMessageKey(message));
+            continue;
+          }
+
           const delivered = await deliverToSubscribers(
             formatRadarMessage(message),
           );
+          rememberRadarText(rawText, recentRadarTexts, now);
           knownRadarMessages.add(radarMessageKey(message));
           console.log(
             `Новое событие RadarMap отправлено подписчикам: ${delivered}.`,

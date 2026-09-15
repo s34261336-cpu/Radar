@@ -44,6 +44,7 @@ type TelegramBotOptions = {
   token: string;
   radarMapApiUrl: string;
   radarMapPollIntervalMs: number;
+  radarDuplicateWindowMs: number;
 };
 
 const API_BASE_URL = "https://api.telegram.org";
@@ -52,6 +53,7 @@ const POLL_TIMEOUT_SECONDS = 25;
 const RETRY_DELAY_MS = 5_000;
 const SEND_DELAY_MS = 40;
 const RADAR_MAP_REQUEST_TIMEOUT_MS = 10_000;
+const DEFAULT_RADAR_DUPLICATE_WINDOW_MS = 30 * 60 * 1000;
 const RADAR_SIGNATURE_PATTERN =
   /\s*📡\s*Локатор России\s*[-–—]\s*@locatorru\s*$/iu;
 const TELEGRAM_COMMANDS = [
@@ -166,6 +168,74 @@ function removeRadarSignature(text: string): string {
   return text.replace(RADAR_SIGNATURE_PATTERN, "").trim();
 }
 
+function normalizeRadarText(text: string): string {
+  return removeRadarSignature(text)
+    .toLowerCase()
+    .replaceAll("ё", "е")
+    .replace(/[^\p{L}\p{N}]+/gu, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function areNearDuplicateTexts(left: string, right: string): boolean {
+  if (left === right) {
+    return true;
+  }
+
+  if (left.length < 24 || right.length < 24) {
+    return false;
+  }
+
+  const leftWords = new Set(left.split(" "));
+  const rightWords = new Set(right.split(" "));
+  const intersectionSize = [...leftWords].filter((word) =>
+    rightWords.has(word),
+  ).length;
+  const unionSize = new Set([...leftWords, ...rightWords]).size;
+  const lengthRatio =
+    Math.min(left.length, right.length) / Math.max(left.length, right.length);
+
+  return intersectionSize / unionSize >= 0.85 && lengthRatio >= 0.75;
+}
+
+type RecentRadarText = {
+  normalizedText: string;
+  seenAt: number;
+};
+
+function isRecentRadarDuplicate(
+  message: RadarMapMessage,
+  recentTexts: RecentRadarText[],
+  now: number,
+  windowMs: number,
+): boolean {
+  const normalizedText = normalizeRadarText(message.text ?? "");
+  if (!normalizedText) {
+    return false;
+  }
+
+  for (let index = recentTexts.length - 1; index >= 0; index -= 1) {
+    if (now - recentTexts[index].seenAt > windowMs) {
+      recentTexts.splice(index, 1);
+    }
+  }
+
+  return recentTexts.some((entry) =>
+    areNearDuplicateTexts(entry.normalizedText, normalizedText),
+  );
+}
+
+function rememberRadarText(
+  message: RadarMapMessage,
+  recentTexts: RecentRadarText[],
+  now: number,
+): void {
+  const normalizedText = normalizeRadarText(message.text ?? "");
+  if (normalizedText) {
+    recentTexts.push({ normalizedText, seenAt: now });
+  }
+}
+
 function normalizeCommand(text: string): string {
   return text.trim().split(/\s+/, 1)[0].toLowerCase().split("@", 1)[0];
 }
@@ -247,6 +317,7 @@ async function runRadarMapPoller(
   isStopped: () => boolean,
 ): Promise<void> {
   const knownKeys = new Set<string>();
+  const recentRadarTexts: RecentRadarText[] = [];
   let initialized = false;
 
   while (!isStopped()) {
@@ -267,10 +338,28 @@ async function runRadarMapPoller(
         );
       } else {
         for (const message of freshMessages) {
+          const now = Date.now();
+          if (
+            isRecentRadarDuplicate(
+              message,
+              recentRadarTexts,
+              now,
+              options.radarDuplicateWindowMs,
+            )
+          ) {
+            logger.info(
+              { messageId: message.msg_id },
+              "RadarMap near-duplicate suppressed",
+            );
+            knownKeys.add(radarMessageKey(message));
+            continue;
+          }
+
           const delivered = await deliverToSubscribers(
             options,
             formatRadarMapMessage(message),
           );
+          rememberRadarText(message, recentRadarTexts, now);
           logger.info(
             {
               messageId: message.msg_id,
@@ -319,6 +408,10 @@ export function startTelegramBot() {
     radarMapPollIntervalMs: readPositiveIntEnv(
       "RADAR_MAP_POLL_INTERVAL_MS",
       15_000,
+    ),
+    radarDuplicateWindowMs: readPositiveIntEnv(
+      "RADAR_DUPLICATE_WINDOW_MS",
+      DEFAULT_RADAR_DUPLICATE_WINDOW_MS,
     ),
   };
 

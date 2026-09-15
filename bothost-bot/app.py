@@ -33,6 +33,9 @@ RADAR_MAP_API = (
 POLL_INTERVAL_SECONDS = read_positive_number(
     os.environ.get("RADAR_MAP_POLL_INTERVAL_MS"), 15_000
 ) / 1000
+DUPLICATE_WINDOW_SECONDS = read_positive_number(
+    os.environ.get("RADAR_DUPLICATE_WINDOW_MS"), 30 * 60 * 1000
+) / 1000
 TELEGRAM_POLL_TIMEOUT_SECONDS = 25
 RETRY_DELAY_SECONDS = 5
 SEND_DELAY_SECONDS = 0.04
@@ -234,6 +237,58 @@ def remove_radar_signature(text: str) -> str:
     return RADAR_SIGNATURE_PATTERN.sub("", text).strip()
 
 
+def normalize_radar_text(text: str) -> str:
+    normalized = remove_radar_signature(text).lower().replace("ё", "е")
+    return re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE).strip()
+
+
+def are_near_duplicate_texts(left: str, right: str) -> bool:
+    if left == right:
+        return True
+    if len(left) < 24 or len(right) < 24:
+        return False
+
+    left_words = set(left.split())
+    right_words = set(right.split())
+    union = left_words | right_words
+    intersection = left_words & right_words
+    length_ratio = min(len(left), len(right)) / max(len(left), len(right))
+    return (
+        len(intersection) / len(union) >= 0.85
+        and length_ratio >= 0.75
+    )
+
+
+def is_recent_radar_duplicate(
+    text: str,
+    recent_texts: list[tuple[str, float]],
+    now: float,
+) -> bool:
+    normalized_text = normalize_radar_text(text)
+    if not normalized_text:
+        return False
+
+    recent_texts[:] = [
+        (known_text, seen_at)
+        for known_text, seen_at in recent_texts
+        if now - seen_at <= DUPLICATE_WINDOW_SECONDS
+    ]
+    return any(
+        are_near_duplicate_texts(known_text, normalized_text)
+        for known_text, _seen_at in recent_texts
+    )
+
+
+def remember_radar_text(
+    text: str,
+    recent_texts: list[tuple[str, float]],
+    now: float,
+) -> None:
+    normalized_text = normalize_radar_text(text)
+    if normalized_text:
+        recent_texts.append((normalized_text, now))
+
+
 def format_radar_message(message: dict[str, Any]) -> str:
     time_label = message.get("time_label")
     header = f"<b>{html.escape(str(time_label))}</b>\n\n" if time_label else ""
@@ -262,6 +317,7 @@ def fetch_radar_messages() -> list[dict[str, Any]]:
 def radar_map_loop() -> None:
     known_keys: set[str] = set()
     known_order: list[str] = []
+    recent_radar_texts: list[tuple[str, float]] = []
     initialized = False
 
     while not STOP_EVENT.is_set():
@@ -288,9 +344,26 @@ def radar_map_loop() -> None:
                 )
             else:
                 for message in fresh_messages:
+                    raw_text = str(message.get("text") or "")
+                    now = time.monotonic()
+                    if is_recent_radar_duplicate(
+                        raw_text,
+                        recent_radar_texts,
+                        now,
+                    ):
+                        print(
+                            "Похожее событие RadarMap пропущено как повторное.",
+                            flush=True,
+                        )
+                        key = radar_message_key(message)
+                        known_keys.add(key)
+                        known_order.append(key)
+                        continue
+
                     delivered = deliver_to_subscribers(
                         format_radar_message(message)
                     )
+                    remember_radar_text(raw_text, recent_radar_texts, now)
                     key = radar_message_key(message)
                     known_keys.add(key)
                     known_order.append(key)
