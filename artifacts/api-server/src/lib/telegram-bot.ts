@@ -1,6 +1,10 @@
 import { db, telegramSubscribers } from "@workspace/db";
 import { eq } from "drizzle-orm";
 import { logger } from "./logger";
+import {
+  renderRadarMapScreenshot,
+  sendTelegramPhoto,
+} from "./radar-map-image";
 
 type TelegramChat = {
   id: number;
@@ -72,13 +76,15 @@ const TELEGRAM_COMMANDS = [
   { command: "stop", description: "Отписаться от рассылки" },
   { command: "help", description: "Показать список команд" },
   { command: "commands", description: "Показать список команд" },
+  { command: "map", description: "Показать текущую карту RadarMap" },
 ];
 const COMMANDS_TEXT =
   "Доступные команды:\n" +
   "/start — подписаться на новые сообщения\n" +
   "/stop — отписаться от рассылки\n" +
   "/help — показать этот список\n" +
-  "/commands — показать этот список";
+  "/commands — показать этот список\n" +
+  "/map — показать текущую карту RadarMap";
 
 function readTelegramToken(): string | undefined {
   for (const name of [
@@ -302,9 +308,19 @@ async function fetchRadarMapState(
 async function deliverToSubscribers(
   options: TelegramBotOptions,
   text: string,
+  includeMap = false,
 ): Promise<number> {
   const subscribers = await db.select().from(telegramSubscribers);
   let delivered = 0;
+  let mapPath: string | undefined;
+
+  if (includeMap && subscribers.length > 0) {
+    try {
+      mapPath = await renderRadarMapScreenshot();
+    } catch (error) {
+      logger.warn({ err: error }, "Could not render RadarMap screenshot");
+    }
+  }
 
   for (const subscriber of subscribers) {
     try {
@@ -314,6 +330,21 @@ async function deliverToSubscribers(
         parse_mode: "HTML",
         disable_web_page_preview: true,
       });
+      if (mapPath) {
+        try {
+          await sendTelegramPhoto(
+            options.token,
+            subscriber.chatId,
+            mapPath,
+            "Текущая карта RadarMap. Данные могут быть приблизительными.",
+          );
+        } catch (error) {
+          logger.warn(
+            { err: error, chatId: subscriber.chatId },
+            "RadarMap screenshot could not be delivered",
+          );
+        }
+      }
       delivered += 1;
     } catch (error) {
       const description = error instanceof Error ? error.message : "";
@@ -333,6 +364,28 @@ async function deliverToSubscribers(
   }
 
   return delivered;
+}
+
+async function sendMapToChat(
+  options: TelegramBotOptions,
+  chatId: string | number,
+): Promise<void> {
+  try {
+    const mapPath = await renderRadarMapScreenshot();
+    await sendTelegramPhoto(
+      options.token,
+      chatId,
+      mapPath,
+      "Текущая карта RadarMap. Данные могут быть приблизительными.",
+    );
+  } catch (error) {
+    logger.warn({ err: error, chatId }, "Could not send RadarMap screenshot");
+    await callTelegramApi(options, "sendMessage", {
+      chat_id: chatId,
+      text: "Не удалось подготовить снимок карты. Живая карта: https://radar-map.ru/",
+      disable_web_page_preview: false,
+    });
+  }
 }
 
 async function runRadarMapPoller(
@@ -390,6 +443,7 @@ async function runRadarMapPoller(
           const delivered = await deliverToSubscribers(
             options,
             formatRadarMapMessage(message),
+            true,
           );
           rememberRadarText(message, recentRadarTexts, now);
           logger.info(
@@ -521,6 +575,8 @@ export function startTelegramBot() {
               chat_id: message.chat.id,
               text: COMMANDS_TEXT,
             });
+          } else if (command === "/map") {
+            await sendMapToChat(options, message.chat.id);
           }
         }
       } catch (error) {
