@@ -56,6 +56,14 @@ const RADAR_MAP_REQUEST_TIMEOUT_MS = 10_000;
 const DEFAULT_RADAR_DUPLICATE_WINDOW_MS = 30 * 60 * 1000;
 const RADAR_SIGNATURE_PATTERN =
   /\s*📡\s*Локатор России\s*[-–—]\s*@locatorru\s*$/iu;
+const DONATION_LINK_PATTERN =
+  /(?:https?:\/\/)?(?:www\.)?(?:pay\.)?cloudtips\.ru\b/iu;
+const SUPPORT_APPEAL_PATTERN =
+  /(?:поддержк\w*|деятельност\w*|донат\w*|пожертвован\w*|помощ\w*)/iu;
+const WARM_APPEAL_PATTERN =
+  /(?:наши\s+дорогие\s+близкие|спасибо\s+огромн\w*\s+за\s+поддержк\w*|поддержк\w*\s+(?:нашей|нашу|нашего)\s+деятельност\w*)/iu;
+const EXTERNAL_LINK_PATTERN = /https?:\/\/\S+/iu;
+const HEART_PATTERN = /(?:❤️|❤|♥️|💕|💖|💗|💓|💞|💘)/gu;
 const TELEGRAM_COMMANDS = [
   {
     command: "start",
@@ -166,6 +174,21 @@ function escapeTelegramHtml(value: string): string {
 
 function removeRadarSignature(text: string): string {
   return text.replace(RADAR_SIGNATURE_PATTERN, "").trim();
+}
+
+function isUnwantedPromotionalMessage(text: string): boolean {
+  const cleanedText = removeRadarSignature(text);
+  const heartCount = cleanedText.match(HEART_PATTERN)?.length ?? 0;
+  const hasDonationLink = DONATION_LINK_PATTERN.test(cleanedText);
+  const hasSupportAppeal =
+    SUPPORT_APPEAL_PATTERN.test(cleanedText) ||
+    WARM_APPEAL_PATTERN.test(cleanedText);
+
+  return (
+    hasDonationLink ||
+    (hasSupportAppeal &&
+      (EXTERNAL_LINK_PATTERN.test(cleanedText) || heartCount >= 2))
+  );
 }
 
 function normalizeRadarText(text: string): string {
@@ -338,6 +361,15 @@ async function runRadarMapPoller(
         );
       } else {
         for (const message of freshMessages) {
+          if (isUnwantedPromotionalMessage(message.text ?? "")) {
+            logger.info(
+              { messageId: message.msg_id },
+              "RadarMap promotional message suppressed",
+            );
+            knownKeys.add(radarMessageKey(message));
+            continue;
+          }
+
           const now = Date.now();
           if (
             isRecentRadarDuplicate(

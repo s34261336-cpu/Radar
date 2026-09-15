@@ -43,6 +43,21 @@ RADAR_SIGNATURE_PATTERN = re.compile(
     r"\s*📡\s*Локатор России\s*[-–—]\s*@locatorru\s*$",
     re.IGNORECASE,
 )
+DONATION_LINK_PATTERN = re.compile(
+    r"(?:https?://)?(?:www\.)?(?:pay\.)?cloudtips\.ru\b",
+    re.IGNORECASE,
+)
+SUPPORT_APPEAL_PATTERN = re.compile(
+    r"\b(?:поддержк\w*|деятельност\w*|донат\w*|пожертвован\w*|помощ\w*)\b",
+    re.IGNORECASE,
+)
+WARM_APPEAL_PATTERN = re.compile(
+    r"(?:наши\s+дорогие\s+близкие|спасибо\s+огромн\w*\s+за\s+поддержк\w*|"
+    r"поддержк\w*\s+(?:нашей|нашу|нашего)\s+деятельност\w*)",
+    re.IGNORECASE,
+)
+EXTERNAL_LINK_PATTERN = re.compile(r"https?://\S+", re.IGNORECASE)
+HEART_PATTERN = re.compile(r"(?:❤️|❤|♥️|💕|💖|💗|💓|💞|💘)")
 TELEGRAM_COMMANDS = [
     {
         "command": "start",
@@ -237,6 +252,23 @@ def remove_radar_signature(text: str) -> str:
     return RADAR_SIGNATURE_PATTERN.sub("", text).strip()
 
 
+def is_unwanted_promotional_message(text: str) -> bool:
+    cleaned_text = remove_radar_signature(text)
+    heart_count = len(HEART_PATTERN.findall(cleaned_text))
+    has_donation_link = bool(DONATION_LINK_PATTERN.search(cleaned_text))
+    has_support_appeal = bool(
+        SUPPORT_APPEAL_PATTERN.search(cleaned_text)
+        or WARM_APPEAL_PATTERN.search(cleaned_text)
+    )
+    return bool(
+        has_donation_link
+        or (
+            has_support_appeal
+            and (EXTERNAL_LINK_PATTERN.search(cleaned_text) or heart_count >= 2)
+        )
+    )
+
+
 def normalize_radar_text(text: str) -> str:
     normalized = remove_radar_signature(text).lower().replace("ё", "е")
     return re.sub(r"[^\w]+", " ", normalized, flags=re.UNICODE).strip()
@@ -345,6 +377,17 @@ def radar_map_loop() -> None:
             else:
                 for message in fresh_messages:
                     raw_text = str(message.get("text") or "")
+                    if is_unwanted_promotional_message(raw_text):
+                        print(
+                            "Рекламное или донатное сообщение RadarMap "
+                            "пропущено.",
+                            flush=True,
+                        )
+                        key = radar_message_key(message)
+                        known_keys.add(key)
+                        known_order.append(key)
+                        continue
+
                     now = time.monotonic()
                     if is_recent_radar_duplicate(
                         raw_text,

@@ -21,6 +21,14 @@ const RETRY_DELAY_MS = 5_000;
 const SEND_DELAY_MS = 40;
 const RADAR_SIGNATURE_PATTERN =
   /\s*📡\s*Локатор России\s*[-–—]\s*@locatorru\s*$/iu;
+const DONATION_LINK_PATTERN =
+  /(?:https?:\/\/)?(?:www\.)?(?:pay\.)?cloudtips\.ru\b/iu;
+const SUPPORT_APPEAL_PATTERN =
+  /(?:поддержк\w*|деятельност\w*|донат\w*|пожертвован\w*|помощ\w*)/iu;
+const WARM_APPEAL_PATTERN =
+  /(?:наши\s+дорогие\s+близкие|спасибо\s+огромн\w*\s+за\s+поддержк\w*|поддержк\w*\s+(?:нашей|нашу|нашего)\s+деятельност\w*)/iu;
+const EXTERNAL_LINK_PATTERN = /https?:\/\/\S+/iu;
+const HEART_PATTERN = /(?:❤️|❤|♥️|💕|💖|💗|💓|💞|💘)/gu;
 const TELEGRAM_COMMANDS = [
   { command: "start", description: "Подписаться на новые сообщения" },
   { command: "stop", description: "Отписаться от рассылки" },
@@ -76,6 +84,21 @@ function radarMessageKey(message) {
 
 function removeRadarSignature(text) {
   return text.replace(RADAR_SIGNATURE_PATTERN, "").trim();
+}
+
+function isUnwantedPromotionalMessage(text) {
+  const cleanedText = removeRadarSignature(text);
+  const heartCount = cleanedText.match(HEART_PATTERN)?.length || 0;
+  const hasDonationLink = DONATION_LINK_PATTERN.test(cleanedText);
+  const hasSupportAppeal =
+    SUPPORT_APPEAL_PATTERN.test(cleanedText) ||
+    WARM_APPEAL_PATTERN.test(cleanedText);
+
+  return (
+    hasDonationLink ||
+    (hasSupportAppeal &&
+      (EXTERNAL_LINK_PATTERN.test(cleanedText) || heartCount >= 2))
+  );
 }
 
 function normalizeRadarText(text) {
@@ -278,6 +301,12 @@ async function radarMapLoop() {
       } else {
         for (const message of freshMessages) {
           const rawText = message.text || "";
+          if (isUnwantedPromotionalMessage(rawText)) {
+            console.log("Рекламное или донатное сообщение RadarMap пропущено.");
+            knownRadarMessages.add(radarMessageKey(message));
+            continue;
+          }
+
           const now = Date.now();
           if (isRecentRadarDuplicate(rawText, recentRadarTexts, now)) {
             console.log("Похожее событие RadarMap пропущено как повторное.");
