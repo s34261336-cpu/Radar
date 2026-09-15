@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import html
 import json
 import os
 import re
 import shutil
 import signal
+import socket
 import subprocess
 import tempfile
 import threading
@@ -15,6 +17,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -75,7 +78,7 @@ TELEGRAM_COMMANDS = [
     {"command": "stop", "description": "Отписаться от рассылки"},
     {"command": "help", "description": "Показать список команд"},
     {"command": "commands", "description": "Показать список команд"},
-    {"command": "map", "description": "Открыть живую карту RadarMap"},
+    {"command": "map", "description": "Получить фото карты"},
 ]
 COMMANDS_TEXT = (
     "Доступные команды:\n"
@@ -83,7 +86,7 @@ COMMANDS_TEXT = (
     "/stop — отписаться от рассылки\n"
     "/help — показать этот список\n"
     "/commands — показать этот список\n"
-    "/map — получить фото живой карты RadarMap\n"
+    "/map — получить фото карты\n"
 )
 FILE_LOCK = threading.Lock()
 MAP_SCREENSHOT_LOCK = threading.Lock()
@@ -91,6 +94,48 @@ STOP_EVENT = threading.Event()
 MAP_SCREENSHOT_PATH: Path | None = None
 MAP_SCREENSHOT_DIRECTORY: Path | None = None
 MAP_SCREENSHOT_CREATED_AT = 0.0
+CLEAN_MAP_SCRIPT = r"""
+(() => {
+  const style = document.createElement("style");
+  style.textContent = `
+    html, body {
+      width: 100% !important;
+      height: 100% !important;
+      margin: 0 !important;
+      padding: 0 !important;
+      overflow: hidden !important;
+      background: #dce5ec !important;
+    }
+    .top-chrome,
+    .feed,
+    .site-footer,
+    .cookie-consent,
+    #map-toolbar,
+    #mapPrefsPop,
+    #serviceBanner,
+    #map-updating,
+    .ol-control {
+      display: none !important;
+    }
+    .main,
+    .map-wrap,
+    #map {
+      position: fixed !important;
+      inset: 0 !important;
+      width: 100vw !important;
+      height: 100vh !important;
+      min-height: 100vh !important;
+      margin: 0 !important;
+      padding: 0 !important;
+    }
+  `;
+  document.head.appendChild(style);
+  if (window.RadarMapConsent) {
+    window.RadarMapConsent.acknowledge();
+  }
+  window.dispatchEvent(new Event("resize"));
+})();
+"""
 
 
 def get_token() -> str:
@@ -449,6 +494,167 @@ def format_radar_message(message: dict[str, Any]) -> str:
     return f"{header}{html.escape(text)}".strip()
 
 
+def read_socket_bytes(connection: socket.socket, size: int) -> bytes:
+    chunks: list[bytes] = []
+    remaining = size
+    while remaining:
+        chunk = connection.recv(remaining)
+        if not chunk:
+            raise RuntimeError("DevTools connection closed unexpectedly")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def websocket_connect(url: str) -> socket.socket:
+    parsed = urlsplit(url)
+    if parsed.hostname is None or parsed.port is None:
+        raise RuntimeError("Invalid DevTools WebSocket URL")
+
+    connection = socket.create_connection(
+        (parsed.hostname, parsed.port),
+        timeout=10,
+    )
+    path = parsed.path or "/"
+    if parsed.query:
+        path = f"{path}?{parsed.query}"
+    key = base64.b64encode(os.urandom(16)).decode("ascii")
+    handshake = (
+        f"GET {path} HTTP/1.1\r\n"
+        f"Host: {parsed.hostname}:{parsed.port}\r\n"
+        "Upgrade: websocket\r\n"
+        "Connection: Upgrade\r\n"
+        f"Sec-WebSocket-Key: {key}\r\n"
+        "Sec-WebSocket-Version: 13\r\n\r\n"
+    ).encode("ascii")
+    connection.sendall(handshake)
+
+    response = b""
+    while b"\r\n\r\n" not in response:
+        chunk = connection.recv(4096)
+        if not chunk:
+            connection.close()
+            raise RuntimeError("DevTools WebSocket handshake failed")
+        response += chunk
+        if len(response) > 16_384:
+            connection.close()
+            raise RuntimeError("DevTools WebSocket handshake was too large")
+    if not response.startswith(b"HTTP/1.1 101"):
+        connection.close()
+        raise RuntimeError("DevTools WebSocket upgrade was rejected")
+    return connection
+
+
+def websocket_send(connection: socket.socket, payload: str) -> None:
+    data = payload.encode("utf-8")
+    length = len(data)
+    if length < 126:
+        header = bytes([0x81, 0x80 | length])
+    elif length < 65_536:
+        header = bytes([0x81, 0x80 | 126]) + length.to_bytes(2, "big")
+    else:
+        header = bytes([0x81, 0x80 | 127]) + length.to_bytes(8, "big")
+
+    mask = os.urandom(4)
+    masked_data = bytes(
+        value ^ mask[index % 4] for index, value in enumerate(data)
+    )
+    connection.sendall(header + mask + masked_data)
+
+
+def websocket_send_pong(connection: socket.socket, payload: bytes) -> None:
+    length = len(payload)
+    if length < 126:
+        header = bytes([0x8A, length])
+    elif length < 65_536:
+        header = bytes([0x8A, 126]) + length.to_bytes(2, "big")
+    else:
+        header = bytes([0x8A, 127]) + length.to_bytes(8, "big")
+    connection.sendall(header + payload)
+
+
+def websocket_receive(connection: socket.socket) -> tuple[int, bytes]:
+    first, second = read_socket_bytes(connection, 2)
+    opcode = first & 0x0F
+    payload_length = second & 0x7F
+    if payload_length == 126:
+        payload_length = int.from_bytes(
+            read_socket_bytes(connection, 2),
+            "big",
+        )
+    elif payload_length == 127:
+        payload_length = int.from_bytes(
+            read_socket_bytes(connection, 8),
+            "big",
+        )
+
+    masked = bool(second & 0x80)
+    mask = read_socket_bytes(connection, 4) if masked else b""
+    payload = read_socket_bytes(connection, payload_length)
+    if masked:
+        payload = bytes(
+            value ^ mask[index % 4]
+            for index, value in enumerate(payload)
+        )
+    return opcode, payload
+
+
+def devtools_command(
+    connection: socket.socket,
+    command_id: int,
+    method: str,
+    params: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    websocket_send(
+        connection,
+        json.dumps(
+            {
+                "id": command_id,
+                "method": method,
+                "params": params or {},
+            }
+        ),
+    )
+    while True:
+        opcode, payload = websocket_receive(connection)
+        if opcode == 0x9:
+            websocket_send_pong(connection, payload)
+            continue
+        if opcode == 0x8:
+            raise RuntimeError("DevTools WebSocket closed")
+        if opcode != 0x1:
+            continue
+
+        message = json.loads(payload.decode("utf-8"))
+        if message.get("id") != command_id:
+            continue
+        if "error" in message:
+            raise RuntimeError(
+                str(message["error"].get("message", "DevTools command failed"))
+            )
+        return message.get("result", {})
+
+
+def wait_for_devtools_target(port: int) -> str:
+    for _attempt in range(80):
+        try:
+            with urlopen(
+                f"http://127.0.0.1:{port}/json/list",
+                timeout=2,
+            ) as response:
+                targets = json.loads(response.read().decode("utf-8"))
+            for target in targets:
+                if (
+                    target.get("type") == "page"
+                    and target.get("webSocketDebuggerUrl")
+                ):
+                    return target["webSocketDebuggerUrl"]
+        except (OSError, URLError, json.JSONDecodeError):
+            pass
+        time.sleep(0.1)
+    raise RuntimeError("DevTools target did not start")
+
+
 def render_radar_map_screenshot() -> Path:
     global MAP_SCREENSHOT_CREATED_AT
     global MAP_SCREENSHOT_DIRECTORY
@@ -465,6 +671,10 @@ def render_radar_map_screenshot() -> Path:
 
         directory = Path(tempfile.mkdtemp(prefix="radarmap-shot-"))
         output_path = directory / "radarmap.png"
+        port_socket = socket.socket()
+        port_socket.bind(("127.0.0.1", 0))
+        port = int(port_socket.getsockname()[1])
+        port_socket.close()
         command = [
             CHROMIUM_PATH,
             "--headless",
@@ -476,37 +686,77 @@ def render_radar_map_screenshot() -> Path:
             "--no-default-browser-check",
             f"--user-data-dir={directory / 'profile'}",
             "--window-size=1280,900",
-            "--virtual-time-budget=7000",
-            "--run-all-compositor-stages-before-draw",
-            f"--screenshot={output_path}",
-            RADAR_MAP_URL,
+            f"--remote-debugging-port={port}",
+            "--remote-debugging-address=127.0.0.1",
+            "about:blank",
         ]
+        browser: subprocess.Popen[bytes] | None = None
+        connection: socket.socket | None = None
 
         try:
-            subprocess.run(
+            browser = subprocess.Popen(
                 command,
-                check=True,
                 stdout=subprocess.DEVNULL,
-                stderr=subprocess.PIPE,
-                text=True,
-                timeout=45,
+                stderr=subprocess.DEVNULL,
             )
+            target_url = wait_for_devtools_target(port)
+            connection = websocket_connect(target_url)
+            devtools_command(connection, 1, "Page.enable")
+            devtools_command(connection, 2, "Runtime.enable")
+            devtools_command(
+                connection,
+                3,
+                "Page.navigate",
+                {"url": RADAR_MAP_URL},
+            )
+            time.sleep(7)
+            devtools_command(
+                connection,
+                4,
+                "Runtime.evaluate",
+                {
+                    "expression": CLEAN_MAP_SCRIPT,
+                    "returnByValue": True,
+                },
+            )
+            time.sleep(0.8)
+            screenshot = devtools_command(
+                connection,
+                5,
+                "Page.captureScreenshot",
+                {
+                    "format": "png",
+                    "fromSurface": True,
+                    "captureBeyondViewport": False,
+                },
+            )
+            screenshot_data = screenshot.get("data")
+            if not isinstance(screenshot_data, str) or not screenshot_data:
+                raise RuntimeError("Chromium вернул пустой снимок RadarMap")
+            output_path.write_bytes(base64.b64decode(screenshot_data))
         except (
             OSError,
             subprocess.CalledProcessError,
             subprocess.TimeoutExpired,
         ) as error:
             shutil.rmtree(directory, ignore_errors=True)
-            details = str(error)
-            if isinstance(error, subprocess.CalledProcessError):
-                details = error.stderr[-1000:].strip() or details
-            raise RuntimeError(
-                f"Не удалось сделать снимок RadarMap: {details}"
-            ) from error
+            raise RuntimeError(f"Не удалось сделать снимок карты: {error}") from error
+        except Exception as error:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise RuntimeError(f"Не удалось сделать снимок карты: {error}") from error
+        finally:
+            if connection is not None:
+                connection.close()
+            if browser is not None and browser.poll() is None:
+                browser.terminate()
+                try:
+                    browser.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    browser.kill()
 
         if not output_path.exists() or output_path.stat().st_size == 0:
             shutil.rmtree(directory, ignore_errors=True)
-            raise RuntimeError("Chromium вернул пустой снимок RadarMap")
+            raise RuntimeError("Chromium вернул пустой снимок карты")
 
         old_directory = MAP_SCREENSHOT_DIRECTORY
         MAP_SCREENSHOT_DIRECTORY = directory
@@ -679,11 +929,12 @@ def telegram_loop() -> None:
                     send_command(chat["id"], COMMANDS_TEXT)
                 elif command == "/map":
                     try:
+                        send_command(chat["id"], "Готовлю карту…")
                         map_image = render_radar_map_screenshot()
                         telegram_photo(
                             chat["id"],
                             map_image,
-                            "Живая карта RadarMap",
+                            "Карта готова.",
                         )
                     except Exception as error:
                         print(
