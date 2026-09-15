@@ -65,7 +65,17 @@ function readPositiveNumber(value, fallback) {
 }
 
 function sleep(milliseconds) {
-  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+  return new Promise((resolve) => {
+    const deadline = Date.now() + milliseconds;
+    const check = () => {
+      if (stopped || Date.now() >= deadline) {
+        resolve();
+        return;
+      }
+      setTimeout(check, Math.min(250, deadline - Date.now()));
+    };
+    check();
+  });
 }
 
 function escapeHtml(value) {
@@ -169,14 +179,23 @@ async function telegram(method, body = {}) {
 
   const payload = await response.json();
   if (!response.ok || !payload.ok) {
-    throw new Error(
+    const error = new Error(
       `Telegram API ${method} failed: ${
         payload.description || `HTTP ${response.status}`
       }`,
     );
+    error.telegramErrorCode = payload.error_code || response.status;
+    throw error;
   }
 
   return payload.result;
+}
+
+function isPollingConflict(error) {
+  return (
+    error?.telegramErrorCode === 409 ||
+    /terminated by other getUpdates request/i.test(error?.message || "")
+  );
 }
 
 async function loadSubscribers() {
@@ -343,13 +362,24 @@ async function radarMapLoop() {
 }
 
 async function telegramLoop() {
-  await telegram("deleteWebhook", { drop_pending_updates: false });
-  const bot = await telegram("getMe");
-  console.log(`Бот @${bot.username || "без_username"} запущен.`);
   try {
-    await telegram("setMyCommands", { commands: TELEGRAM_COMMANDS });
+    await telegram("deleteWebhook", { drop_pending_updates: false });
+    const bot = await telegram("getMe");
+    console.log(`Бот @${bot.username || "без_username"} запущен.`);
+    try {
+      await telegram("setMyCommands", { commands: TELEGRAM_COMMANDS });
+    } catch (error) {
+      console.warn("Не удалось установить меню команд:", error.message);
+    }
   } catch (error) {
-    console.warn("Не удалось установить меню команд:", error.message);
+    if (isPollingConflict(error)) {
+      throw new Error(
+        "Этот токен Telegram уже используется другим экземпляром бота. " +
+          "Остановите старый экземпляр или создайте новый токен в BotFather.",
+        { cause: error },
+      );
+    }
+    throw error;
   }
 
   while (!stopped) {
@@ -387,6 +417,13 @@ async function telegramLoop() {
         }
       }
     } catch (error) {
+      if (isPollingConflict(error)) {
+        throw new Error(
+          "Этот токен Telegram уже используется другим экземпляром бота. " +
+            "Остановите старый экземпляр или создайте новый токен в BotFather.",
+          { cause: error },
+        );
+      }
       if (!stopped) {
         console.error(
           "Ошибка Telegram polling:",
@@ -410,6 +447,7 @@ process.once("SIGTERM", () => {
 });
 
 main().catch((error) => {
+  stopped = true;
   console.error("Бот остановлен из-за ошибки запуска:", error);
   process.exitCode = 1;
 });

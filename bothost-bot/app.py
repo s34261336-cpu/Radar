@@ -139,11 +139,20 @@ def telegram(method: str, body: dict[str, Any] | None = None) -> Any:
         timeout=TELEGRAM_POLL_TIMEOUT_SECONDS + 10,
     )
     if not response.get("ok") or "result" not in response:
-        raise RuntimeError(
+        error = RuntimeError(
             f"Telegram API {method} failed: "
             f"{response.get('description', 'unknown error')}"
         )
+        setattr(error, "telegram_error_code", response.get("error_code"))
+        raise error
     return response["result"]
+
+
+def is_polling_conflict(error: Exception) -> bool:
+    return bool(
+        getattr(error, "telegram_error_code", None) == 409
+        or "terminated by other getUpdates request" in str(error)
+    )
 
 
 def load_subscribers() -> list[dict[str, Any]]:
@@ -443,10 +452,19 @@ def register_telegram_commands() -> None:
 
 def telegram_loop() -> None:
     update_offset = 0
-    telegram("deleteWebhook", {"drop_pending_updates": False})
-    bot = telegram("getMe")
-    print(f"Бот @{bot.get('username', 'без_username')} запущен.", flush=True)
-    register_telegram_commands()
+    try:
+        telegram("deleteWebhook", {"drop_pending_updates": False})
+        bot = telegram("getMe")
+        print(f"Бот @{bot.get('username', 'без_username')} запущен.", flush=True)
+        register_telegram_commands()
+    except Exception as error:
+        if is_polling_conflict(error):
+            raise RuntimeError(
+                "Этот токен Telegram уже используется другим экземпляром "
+                "бота. Остановите старый экземпляр или создайте новый токен "
+                "в BotFather."
+            ) from error
+        raise
 
     while not STOP_EVENT.is_set():
         try:
@@ -480,6 +498,12 @@ def telegram_loop() -> None:
                 elif command in {"/help", "/commands"}:
                     send_command(chat["id"], COMMANDS_TEXT)
         except Exception as error:
+            if is_polling_conflict(error):
+                raise RuntimeError(
+                    "Этот токен Telegram уже используется другим экземпляром "
+                    "бота. Остановите старый экземпляр или создайте новый "
+                    "токен в BotFather."
+                ) from error
             if not STOP_EVENT.is_set():
                 print("Ошибка Telegram polling:", error, flush=True)
                 sleep_interruptibly(RETRY_DELAY_SECONDS)

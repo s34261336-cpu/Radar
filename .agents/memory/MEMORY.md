@@ -1,0 +1,1 @@
+- [Telegram polling](telegram-polling.md) — один токен нельзя одновременно использовать в двух long-polling процессах.
