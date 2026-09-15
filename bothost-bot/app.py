@@ -66,13 +66,15 @@ TELEGRAM_COMMANDS = [
     {"command": "stop", "description": "Отписаться от рассылки"},
     {"command": "help", "description": "Показать список команд"},
     {"command": "commands", "description": "Показать список команд"},
+    {"command": "map", "description": "Открыть живую карту RadarMap"},
 ]
 COMMANDS_TEXT = (
     "Доступные команды:\n"
     "/start — подписаться на новые сообщения\n"
     "/stop — отписаться от рассылки\n"
     "/help — показать этот список\n"
-    "/commands — показать этот список"
+    "/commands — показать этот список\n"
+    "/map — открыть живую карту RadarMap: https://radar-map.ru/"
 )
 FILE_LOCK = threading.Lock()
 STOP_EVENT = threading.Event()
@@ -497,6 +499,11 @@ def telegram_loop() -> None:
                     send_command(chat["id"], "Вы отписаны от рассылки.")
                 elif command in {"/help", "/commands"}:
                     send_command(chat["id"], COMMANDS_TEXT)
+                elif command == "/map":
+                    send_command(
+                        chat["id"],
+                        "Живая карта RadarMap:\nhttps://radar-map.ru/",
+                    )
         except Exception as error:
             if is_polling_conflict(error):
                 raise RuntimeError(
