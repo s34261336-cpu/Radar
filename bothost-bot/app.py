@@ -6,7 +6,10 @@ import html
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -30,12 +33,18 @@ RADAR_MAP_API = (
     os.environ.get("RADAR_MAP_API_URL", "").strip()
     or "https://radar-map.ru/api/state"
 )
+RADAR_MAP_URL = "https://radar-map.ru/"
+CHROMIUM_PATH = (
+    os.environ.get("CHROMIUM_PATH", "").strip()
+    or "/repl/tools/bin/chromium"
+)
 POLL_INTERVAL_SECONDS = read_positive_number(
     os.environ.get("RADAR_MAP_POLL_INTERVAL_MS"), 15_000
 ) / 1000
 DUPLICATE_WINDOW_SECONDS = read_positive_number(
     os.environ.get("RADAR_DUPLICATE_WINDOW_MS"), 30 * 60 * 1000
 ) / 1000
+MAP_SCREENSHOT_CACHE_SECONDS = 30
 TELEGRAM_POLL_TIMEOUT_SECONDS = 25
 RETRY_DELAY_SECONDS = 5
 SEND_DELAY_SECONDS = 0.04
@@ -74,10 +83,14 @@ COMMANDS_TEXT = (
     "/stop — отписаться от рассылки\n"
     "/help — показать этот список\n"
     "/commands — показать этот список\n"
-    "/map — открыть живую карту RadarMap: https://radar-map.ru/"
+    "/map — получить фото живой карты RadarMap\n"
 )
 FILE_LOCK = threading.Lock()
+MAP_SCREENSHOT_LOCK = threading.Lock()
 STOP_EVENT = threading.Event()
+MAP_SCREENSHOT_PATH: Path | None = None
+MAP_SCREENSHOT_DIRECTORY: Path | None = None
+MAP_SCREENSHOT_CREATED_AT = 0.0
 
 
 def get_token() -> str:
@@ -133,6 +146,76 @@ def request_json(
     return result
 
 
+def request_multipart(
+    url: str,
+    *,
+    fields: dict[str, str],
+    file_field: str,
+    file_path: Path,
+    file_name: str,
+    content_type: str,
+    timeout: int = 60,
+) -> dict[str, Any]:
+    boundary = f"----RadarMapBot{os.urandom(12).hex()}"
+    parts: list[bytes] = []
+
+    for name, value in fields.items():
+        parts.extend(
+            [
+                f"--{boundary}\r\n".encode("ascii"),
+                (
+                    f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                ).encode("utf-8"),
+                value.encode("utf-8"),
+                b"\r\n",
+            ]
+        )
+
+    parts.extend(
+        [
+            f"--{boundary}\r\n".encode("ascii"),
+            (
+                f'Content-Disposition: form-data; name="{file_field}"; '
+                f'filename="{file_name}"\r\n'
+            ).encode("utf-8"),
+            f"Content-Type: {content_type}\r\n\r\n".encode("ascii"),
+            file_path.read_bytes(),
+            b"\r\n",
+            f"--{boundary}--\r\n".encode("ascii"),
+        ]
+    )
+
+    request = Request(
+        url,
+        data=b"".join(parts),
+        headers={
+            "accept": "application/json",
+            "content-type": f"multipart/form-data; boundary={boundary}",
+        },
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            raw = response.read().decode("utf-8")
+    except HTTPError as error:
+        raw = error.read().decode("utf-8", errors="replace")
+        try:
+            details = json.loads(raw).get("description", raw)
+        except json.JSONDecodeError:
+            details = raw or f"HTTP {error.code}"
+        raise RuntimeError(str(details)) from error
+    except URLError as error:
+        raise RuntimeError(str(error.reason)) from error
+
+    try:
+        result = json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("API returned invalid JSON") from error
+    if not isinstance(result, dict):
+        raise RuntimeError("API returned an invalid response")
+    return result
+
+
 def telegram(method: str, body: dict[str, Any] | None = None) -> Any:
     response = request_json(
         f"{TELEGRAM_API}/bot{TOKEN}/{method}",
@@ -143,6 +226,33 @@ def telegram(method: str, body: dict[str, Any] | None = None) -> Any:
     if not response.get("ok") or "result" not in response:
         error = RuntimeError(
             f"Telegram API {method} failed: "
+            f"{response.get('description', 'unknown error')}"
+        )
+        setattr(error, "telegram_error_code", response.get("error_code"))
+        raise error
+    return response["result"]
+
+
+def telegram_photo(
+    chat_id: int | str,
+    photo_path: Path,
+    caption: str | None = None,
+) -> Any:
+    fields = {"chat_id": str(chat_id)}
+    if caption:
+        fields["caption"] = caption
+
+    response = request_multipart(
+        f"{TELEGRAM_API}/bot{TOKEN}/sendPhoto",
+        fields=fields,
+        file_field="photo",
+        file_path=photo_path,
+        file_name="radarmap.png",
+        content_type="image/png",
+    )
+    if not response.get("ok") or "result" not in response:
+        error = RuntimeError(
+            "Telegram API sendPhoto failed: "
             f"{response.get('description', 'unknown error')}"
         )
         setattr(error, "telegram_error_code", response.get("error_code"))
@@ -339,6 +449,74 @@ def format_radar_message(message: dict[str, Any]) -> str:
     return f"{header}{html.escape(text)}".strip()
 
 
+def render_radar_map_screenshot() -> Path:
+    global MAP_SCREENSHOT_CREATED_AT
+    global MAP_SCREENSHOT_DIRECTORY
+    global MAP_SCREENSHOT_PATH
+
+    with MAP_SCREENSHOT_LOCK:
+        now = time.monotonic()
+        if (
+            MAP_SCREENSHOT_PATH is not None
+            and MAP_SCREENSHOT_PATH.exists()
+            and now - MAP_SCREENSHOT_CREATED_AT < MAP_SCREENSHOT_CACHE_SECONDS
+        ):
+            return MAP_SCREENSHOT_PATH
+
+        directory = Path(tempfile.mkdtemp(prefix="radarmap-shot-"))
+        output_path = directory / "radarmap.png"
+        command = [
+            CHROMIUM_PATH,
+            "--headless",
+            "--no-sandbox",
+            "--disable-gpu",
+            "--disable-dev-shm-usage",
+            "--hide-scrollbars",
+            "--no-first-run",
+            "--no-default-browser-check",
+            f"--user-data-dir={directory / 'profile'}",
+            "--window-size=1280,900",
+            "--virtual-time-budget=7000",
+            "--run-all-compositor-stages-before-draw",
+            f"--screenshot={output_path}",
+            RADAR_MAP_URL,
+        ]
+
+        try:
+            subprocess.run(
+                command,
+                check=True,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+                text=True,
+                timeout=45,
+            )
+        except (
+            OSError,
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+        ) as error:
+            shutil.rmtree(directory, ignore_errors=True)
+            details = str(error)
+            if isinstance(error, subprocess.CalledProcessError):
+                details = error.stderr[-1000:].strip() or details
+            raise RuntimeError(
+                f"Не удалось сделать снимок RadarMap: {details}"
+            ) from error
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise RuntimeError("Chromium вернул пустой снимок RadarMap")
+
+        old_directory = MAP_SCREENSHOT_DIRECTORY
+        MAP_SCREENSHOT_DIRECTORY = directory
+        MAP_SCREENSHOT_PATH = output_path
+        MAP_SCREENSHOT_CREATED_AT = time.monotonic()
+        if old_directory is not None and old_directory != directory:
+            shutil.rmtree(old_directory, ignore_errors=True)
+        return output_path
+
+
 def fetch_radar_messages() -> list[dict[str, Any]]:
     response = request_json(RADAR_MAP_API)
     messages = response.get("recent_messages")
@@ -500,10 +678,24 @@ def telegram_loop() -> None:
                 elif command in {"/help", "/commands"}:
                     send_command(chat["id"], COMMANDS_TEXT)
                 elif command == "/map":
-                    send_command(
-                        chat["id"],
-                        "Живая карта RadarMap:\nhttps://radar-map.ru/",
-                    )
+                    try:
+                        map_image = render_radar_map_screenshot()
+                        telegram_photo(
+                            chat["id"],
+                            map_image,
+                            "Живая карта RadarMap",
+                        )
+                    except Exception as error:
+                        print(
+                            "Не удалось отправить фото RadarMap:",
+                            error,
+                            flush=True,
+                        )
+                        send_command(
+                            chat["id"],
+                            "Не удалось подготовить фото карты. "
+                            "Попробуйте отправить /map ещё раз через минуту.",
+                        )
         except Exception as error:
             if is_polling_conflict(error):
                 raise RuntimeError(

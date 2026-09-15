@@ -1,1 +1,2 @@
 - [Telegram polling](telegram-polling.md) — один токен нельзя одновременно использовать в двух long-polling процессах.
+- [Telegram map photos](telegram-map-photos.md) — динамический снимок карты требует доступного Chromium; на другом хостинге нужен путь к нему или отдельный image endpoint.
