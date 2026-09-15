@@ -114,6 +114,7 @@ CLEAN_MAP_SCRIPT = r"""
     #mapPrefsPop,
     #serviceBanner,
     #map-updating,
+    #serverWaitOverlay,
     .ol-control {
       display: none !important;
     }
@@ -655,6 +656,54 @@ def wait_for_devtools_target(port: int) -> str:
     raise RuntimeError("DevTools target did not start")
 
 
+def wait_for_map_ready(
+    connection: socket.socket,
+    command_id: int,
+    timeout_seconds: int = 30,
+) -> None:
+    readiness_script = r"""
+(() => {
+  const map = document.getElementById("map");
+  const serverWait = document.getElementById("serverWaitOverlay");
+  const mapUpdating = document.getElementById("map-updating");
+  const isVisible = (element) =>
+    element &&
+    !element.hidden &&
+    getComputedStyle(element).display !== "none" &&
+    getComputedStyle(element).visibility !== "hidden";
+  const hasMapContent = Boolean(
+    map && map.querySelector("canvas, svg, img")
+  );
+  return {
+    ready: Boolean(
+      hasMapContent &&
+      !isVisible(serverWait) &&
+      !isVisible(mapUpdating)
+    ),
+    hasMapContent,
+    serverWaitVisible: Boolean(isVisible(serverWait)),
+    mapUpdatingVisible: Boolean(isVisible(mapUpdating)),
+  };
+})()
+"""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        evaluation = devtools_command(
+            connection,
+            command_id,
+            "Runtime.evaluate",
+            {
+                "expression": readiness_script,
+                "returnByValue": True,
+            },
+        )
+        value = evaluation.get("result", {}).get("value", {})
+        if isinstance(value, dict) and value.get("ready"):
+            return
+        time.sleep(0.5)
+    raise RuntimeError("Карта не успела загрузиться за отведённое время")
+
+
 def render_radar_map_screenshot() -> Path:
     global MAP_SCREENSHOT_CREATED_AT
     global MAP_SCREENSHOT_DIRECTORY
@@ -709,10 +758,10 @@ def render_radar_map_screenshot() -> Path:
                 "Page.navigate",
                 {"url": RADAR_MAP_URL},
             )
-            time.sleep(7)
+            wait_for_map_ready(connection, 4)
             devtools_command(
                 connection,
-                4,
+                5,
                 "Runtime.evaluate",
                 {
                     "expression": CLEAN_MAP_SCRIPT,
@@ -722,7 +771,7 @@ def render_radar_map_screenshot() -> Path:
             time.sleep(0.8)
             screenshot = devtools_command(
                 connection,
-                5,
+                6,
                 "Page.captureScreenshot",
                 {
                     "format": "png",
