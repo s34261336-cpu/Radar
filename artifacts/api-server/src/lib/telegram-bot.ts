@@ -556,6 +556,10 @@ export function startTelegramBot() {
           }
 
           const command = normalizeCommand(message.text);
+          logger.info(
+            { chatId: message.chat.id, command },
+            "Telegram command received",
+          );
 
           if (command === "/start") {
             await subscribeUser(message);
@@ -576,6 +580,10 @@ export function startTelegramBot() {
               text: COMMANDS_TEXT,
             });
           } else if (command === "/map") {
+            await callTelegramApi(options, "sendMessage", {
+              chat_id: message.chat.id,
+              text: "Готовлю текущую карту RadarMap…",
+            });
             await sendMapToChat(options, message.chat.id);
           }
         }
