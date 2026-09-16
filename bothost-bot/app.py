@@ -94,6 +94,18 @@ STOP_EVENT = threading.Event()
 MAP_SCREENSHOT_PATH: Path | None = None
 MAP_SCREENSHOT_DIRECTORY: Path | None = None
 MAP_SCREENSHOT_CREATED_AT = 0.0
+INITIAL_MAP_STYLE_SCRIPT = r"""
+(() => {
+  const style = document.createElement("style");
+  style.textContent = `
+    .feed,
+    .feed--overlay {
+      display: none !important;
+    }
+  `;
+  (document.head || document.documentElement).appendChild(style);
+})();
+"""
 CLEAN_MAP_SCRIPT = r"""
 (() => {
   const style = document.createElement("style");
@@ -755,13 +767,19 @@ def render_radar_map_screenshot() -> Path:
             devtools_command(
                 connection,
                 3,
+                "Page.addScriptToEvaluateOnNewDocument",
+                {"source": INITIAL_MAP_STYLE_SCRIPT},
+            )
+            devtools_command(
+                connection,
+                4,
                 "Page.navigate",
                 {"url": RADAR_MAP_URL},
             )
-            wait_for_map_ready(connection, 4)
+            wait_for_map_ready(connection, 5)
             devtools_command(
                 connection,
-                5,
+                6,
                 "Runtime.evaluate",
                 {
                     "expression": CLEAN_MAP_SCRIPT,
@@ -771,7 +789,7 @@ def render_radar_map_screenshot() -> Path:
             time.sleep(0.8)
             screenshot = devtools_command(
                 connection,
-                6,
+                7,
                 "Page.captureScreenshot",
                 {
                     "format": "png",
