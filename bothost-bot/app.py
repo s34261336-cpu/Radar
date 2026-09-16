@@ -31,7 +31,14 @@ def read_positive_number(value: str | None, fallback: int) -> int:
 
 
 BOT_DIR = Path(__file__).resolve().parent
-SUBSCRIBERS_FILE = BOT_DIR / "subscribers.json"
+configured_subscribers_file = os.environ.get(
+    "RADAR_SUBSCRIBERS_FILE",
+    "data/subscribers.json",
+).strip()
+SUBSCRIBERS_FILE = Path(configured_subscribers_file)
+if not SUBSCRIBERS_FILE.is_absolute():
+    SUBSCRIBERS_FILE = BOT_DIR / SUBSCRIBERS_FILE
+LEGACY_SUBSCRIBERS_FILE = BOT_DIR / "subscribers.json"
 TELEGRAM_API = "https://api.telegram.org"
 RADAR_MAP_API = (
     os.environ.get("RADAR_MAP_API_URL", "").strip()
@@ -361,13 +368,19 @@ def load_subscribers() -> list[dict[str, Any]]:
     try:
         parsed = json.loads(SUBSCRIBERS_FILE.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        return []
+        try:
+            parsed = json.loads(
+                LEGACY_SUBSCRIBERS_FILE.read_text(encoding="utf-8")
+            )
+        except (FileNotFoundError, json.JSONDecodeError):
+            return []
     if not isinstance(parsed, list):
         return []
     return parsed
 
 
 def save_subscribers(subscribers: list[dict[str, Any]]) -> None:
+    SUBSCRIBERS_FILE.parent.mkdir(parents=True, exist_ok=True)
     temporary_file = SUBSCRIBERS_FILE.with_suffix(".json.tmp")
     temporary_file.write_text(
         f"{json.dumps(subscribers, ensure_ascii=False, indent=2)}\n",
