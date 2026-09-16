@@ -43,6 +43,8 @@ CHROMIUM_PATH = (
 )
 MAP_SCREENSHOT_ATTEMPTS = 2
 MAP_SCREENSHOT_RETRY_DELAY_SECONDS = 1
+REQUEST_RETRY_ATTEMPTS = 3
+REQUEST_RETRY_DELAY_SECONDS = 1
 POLL_INTERVAL_SECONDS = read_positive_number(
     os.environ.get("RADAR_MAP_POLL_INTERVAL_MS"), 15_000
 ) / 1000
@@ -184,18 +186,28 @@ def request_json(
         headers["content-type"] = "application/json"
 
     request = Request(url, data=payload, headers=headers, method=method)
-    try:
-        with urlopen(request, timeout=timeout) as response:
-            raw = response.read().decode("utf-8")
-    except HTTPError as error:
-        raw = error.read().decode("utf-8", errors="replace")
+    last_error: Exception | None = None
+    for attempt in range(REQUEST_RETRY_ATTEMPTS):
         try:
-            details = json.loads(raw).get("description", raw)
-        except json.JSONDecodeError:
-            details = raw or f"HTTP {error.code}"
-        raise RuntimeError(str(details)) from error
-    except URLError as error:
-        raise RuntimeError(str(error.reason)) from error
+            with urlopen(request, timeout=timeout) as response:
+                raw = response.read().decode("utf-8")
+            break
+        except HTTPError as error:
+            raw = error.read().decode("utf-8", errors="replace")
+            try:
+                details = json.loads(raw).get("description", raw)
+            except json.JSONDecodeError:
+                details = raw or f"HTTP {error.code}"
+            raise RuntimeError(str(details)) from error
+        except (URLError, socket.gaierror) as error:
+            last_error = error
+            if attempt + 1 < REQUEST_RETRY_ATTEMPTS:
+                time.sleep(REQUEST_RETRY_DELAY_SECONDS)
+                continue
+            reason = getattr(error, "reason", error)
+            raise RuntimeError(str(reason)) from error
+    else:
+        raise RuntimeError(str(last_error or "Network request failed"))
 
     try:
         result = json.loads(raw)
