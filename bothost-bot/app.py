@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
 
@@ -40,6 +40,9 @@ if not SUBSCRIBERS_FILE.is_absolute():
     SUBSCRIBERS_FILE = BOT_DIR / SUBSCRIBERS_FILE
 LEGACY_SUBSCRIBERS_FILE = BOT_DIR / "subscribers.json"
 TELEGRAM_API = "https://api.telegram.org"
+SUPABASE_URL = os.environ.get("SUPABASE_URL", "").strip().rstrip("/")
+SUPABASE_KEY = os.environ.get("SUPABASE_KEY", "").strip()
+SUPABASE_SUBSCRIBERS_TABLE = "radarmap_subscribers"
 RADAR_MAP_API = (
     os.environ.get("RADAR_MAP_API_URL", "").strip()
     or "https://radar-map.ru/api/state"
@@ -195,6 +198,53 @@ def build_ssl_context() -> ssl.SSLContext:
 
 def open_https(request: Request, timeout: int):
     return urlopen(request, timeout=timeout, context=build_ssl_context())
+
+
+def supabase_request(
+    method: str,
+    path: str,
+    *,
+    query: dict[str, str] | None = None,
+    body: Any = None,
+) -> Any:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise RuntimeError(
+            "SUPABASE_URL и SUPABASE_KEY не настроены"
+        )
+
+    url = f"{SUPABASE_URL}/rest/v1/{path.lstrip('/')}"
+    if query:
+        url = f"{url}?{urlencode(query)}"
+    payload = None if body is None else json.dumps(body).encode("utf-8")
+    request = Request(
+        url,
+        data=payload,
+        headers={
+            "accept": "application/json",
+            "apikey": SUPABASE_KEY,
+            "authorization": f"Bearer {SUPABASE_KEY}",
+            "content-type": "application/json",
+            "prefer": "return=representation",
+        },
+        method=method,
+    )
+    try:
+        with open_https(request, timeout=20) as response:
+            raw = response.read().decode("utf-8")
+    except HTTPError as error:
+        raw = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(
+            f"Supabase HTTP {error.code}: {raw[:300]}"
+        ) from error
+    except (URLError, socket.gaierror, ssl.SSLError) as error:
+        raise RuntimeError(f"Supabase connection failed: {error}") from error
+
+    if not raw:
+        return None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as error:
+        raise RuntimeError("Supabase returned invalid JSON") from error
 
 
 def request_json(
@@ -365,6 +415,46 @@ def is_polling_conflict(error: Exception) -> bool:
 
 
 def load_subscribers() -> list[dict[str, Any]]:
+    if SUPABASE_URL and SUPABASE_KEY:
+        try:
+            rows = supabase_request(
+                "GET",
+                SUPABASE_SUBSCRIBERS_TABLE,
+                query={
+                    "select": "chat_id,username,first_name,updated_at",
+                    "order": "updated_at.desc",
+                },
+            )
+            if not isinstance(rows, list):
+                raise RuntimeError("Supabase returned an invalid subscriber list")
+            subscribers = [
+                {
+                    "chatId": str(row["chat_id"]),
+                    "username": row.get("username"),
+                    "firstName": row.get("first_name"),
+                    "updatedAt": row.get("updated_at"),
+                }
+                for row in rows
+                if isinstance(row, dict) and row.get("chat_id") is not None
+            ]
+            if subscribers:
+                return subscribers
+
+            local_subscribers = load_local_subscribers()
+            if local_subscribers:
+                save_subscribers(local_subscribers)
+                return local_subscribers
+            return []
+        except Exception as error:
+            print(
+                "Supabase subscribers read failed; using local fallback:",
+                error,
+                flush=True,
+            )
+    return load_local_subscribers()
+
+
+def load_local_subscribers() -> list[dict[str, Any]]:
     try:
         parsed = json.loads(SUBSCRIBERS_FILE.read_text(encoding="utf-8"))
     except FileNotFoundError:
@@ -387,6 +477,42 @@ def save_subscribers(subscribers: list[dict[str, Any]]) -> None:
         encoding="utf-8",
     )
     temporary_file.replace(SUBSCRIBERS_FILE)
+    if SUPABASE_URL and SUPABASE_KEY and subscribers:
+        rows = [
+            {
+                "chat_id": str(item["chatId"]),
+                "username": item.get("username"),
+                "first_name": item.get("firstName"),
+                "updated_at": item.get("updatedAt"),
+            }
+            for item in subscribers
+        ]
+        try:
+            supabase_request(
+                "POST",
+                SUPABASE_SUBSCRIBERS_TABLE,
+                query={"on_conflict": "chat_id"},
+                body=rows,
+            )
+        except Exception as error:
+            print(
+                "Supabase subscribers write failed; local copy saved:",
+                error,
+                flush=True,
+            )
+
+
+def delete_supabase_subscriber(chat_id: str | int) -> None:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        supabase_request(
+            "DELETE",
+            SUPABASE_SUBSCRIBERS_TABLE,
+            query={"chat_id": f"eq.{chat_id}"},
+        )
+    except Exception as error:
+        print("Supabase subscriber delete failed:", error, flush=True)
 
 
 def subscribe(message: dict[str, Any]) -> None:
@@ -425,6 +551,7 @@ def unsubscribe(chat_id: str | int) -> None:
             item for item in subscribers if item.get("chatId") != chat_id
         ]
         if len(remaining) != len(subscribers):
+            delete_supabase_subscriber(chat_id)
             save_subscribers(remaining)
 
 

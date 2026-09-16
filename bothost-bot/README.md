@@ -29,10 +29,16 @@ BotHost обычно передаёт токен из поля **Bot Token**. К
 - `RADAR_SUBSCRIBERS_FILE` — путь к постоянному файлу подписчиков. По умолчанию
   используется `bothost-bot/data/subscribers.json`, который не перезаписывается
   обновлением кода из Git.
+- `SUPABASE_URL` и `SUPABASE_KEY` — постоянное хранилище подписчиков в Supabase.
+  При их наличии бот использует таблицу `radarmap_subscribers`, а локальный файл
+  остаётся резервной копией.
 
 На BotHost должна сохраняться папка `bothost-bot/data/` между перезапусками.
 Если BotHost предоставляет постоянный каталог, укажите его через
 `RADAR_SUBSCRIBERS_FILE`.
+
+Для Supabase выполните SQL из `supabase_schema.sql`. Для серверного бота
+используйте `service_role` key только через Secrets, не добавляйте его в Git.
 
 ## Команды пользователя
 
