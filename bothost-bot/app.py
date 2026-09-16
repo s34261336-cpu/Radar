@@ -421,6 +421,13 @@ def deliver_to_subscribers(text: str) -> int:
 
     with FILE_LOCK:
         subscribers = load_subscribers()
+    if not subscribers:
+        print(
+            "RadarMap событие не отправлено: нет подписчиков. "
+            "Отправьте боту /start.",
+            flush=True,
+        )
+        return 0
     delivered = 0
 
     for subscriber in subscribers:
@@ -1011,6 +1018,10 @@ def telegram_loop() -> None:
         telegram("deleteWebhook", {"drop_pending_updates": False})
         bot = telegram("getMe")
         print(f"Бот @{bot.get('username', 'без_username')} запущен.", flush=True)
+        print(
+            f"Активных подписчиков: {len(load_subscribers())}.",
+            flush=True,
+        )
         register_telegram_commands()
     except Exception as error:
         if is_polling_conflict(error):
