@@ -41,6 +41,8 @@ CHROMIUM_PATH = (
     os.environ.get("CHROMIUM_PATH", "").strip()
     or "/repl/tools/bin/chromium"
 )
+MAP_SCREENSHOT_ATTEMPTS = 2
+MAP_SCREENSHOT_RETRY_DELAY_SECONDS = 1
 POLL_INTERVAL_SECONDS = read_positive_number(
     os.environ.get("RADAR_MAP_POLL_INTERVAL_MS"), 15_000
 ) / 1000
@@ -736,8 +738,19 @@ def render_radar_map_screenshot() -> Path:
         port_socket.bind(("127.0.0.1", 0))
         port = int(port_socket.getsockname()[1])
         port_socket.close()
+        chromium_path = CHROMIUM_PATH
+        if not Path(chromium_path).is_file():
+            chromium_path = shutil.which("chromium") or shutil.which(
+                "chromium-browser"
+            ) or shutil.which("google-chrome") or ""
+        if not chromium_path:
+            shutil.rmtree(directory, ignore_errors=True)
+            raise RuntimeError(
+                "Chromium не найден. Проверьте CHROMIUM_PATH или установку браузера."
+            )
+
         command = [
-            CHROMIUM_PATH,
+            chromium_path,
             "--headless",
             "--no-sandbox",
             "--disable-gpu",
@@ -832,6 +845,21 @@ def render_radar_map_screenshot() -> Path:
         if old_directory is not None and old_directory != directory:
             shutil.rmtree(old_directory, ignore_errors=True)
         return output_path
+
+
+def render_radar_map_screenshot_with_retry() -> Path:
+    last_error: Exception | None = None
+    for attempt in range(MAP_SCREENSHOT_ATTEMPTS):
+        try:
+            return render_radar_map_screenshot()
+        except Exception as error:
+            last_error = error
+            if attempt + 1 < MAP_SCREENSHOT_ATTEMPTS:
+                time.sleep(MAP_SCREENSHOT_RETRY_DELAY_SECONDS)
+    assert last_error is not None
+    raise RuntimeError(
+        f"Не удалось подготовить снимок карты после повторной попытки: {last_error}"
+    ) from last_error
 
 
 def fetch_radar_messages() -> list[dict[str, Any]]:
@@ -997,7 +1025,7 @@ def telegram_loop() -> None:
                 elif command == "/map":
                     try:
                         send_command(chat["id"], "Готовлю карту…")
-                        map_image = render_radar_map_screenshot()
+                        map_image = render_radar_map_screenshot_with_retry()
                         telegram_photo(
                             chat["id"],
                             map_image,
