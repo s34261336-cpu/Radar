@@ -10,6 +10,7 @@ import re
 import shutil
 import signal
 import socket
+import ssl
 import subprocess
 import tempfile
 import threading
@@ -172,6 +173,23 @@ def sleep_interruptibly(seconds: float) -> None:
     STOP_EVENT.wait(seconds)
 
 
+def build_ssl_context() -> ssl.SSLContext:
+    verify_ssl = os.environ.get("RADAR_SSL_VERIFY", "1").strip().lower()
+    if verify_ssl in {"0", "false", "no", "off"}:
+        return ssl._create_unverified_context()
+
+    try:
+        import certifi
+
+        return ssl.create_default_context(cafile=certifi.where())
+    except ImportError:
+        return ssl.create_default_context()
+
+
+def open_https(request: Request, timeout: int):
+    return urlopen(request, timeout=timeout, context=build_ssl_context())
+
+
 def request_json(
     url: str,
     *,
@@ -189,7 +207,7 @@ def request_json(
     last_error: Exception | None = None
     for attempt in range(REQUEST_RETRY_ATTEMPTS):
         try:
-            with urlopen(request, timeout=timeout) as response:
+            with open_https(request, timeout=timeout) as response:
                 raw = response.read().decode("utf-8")
             break
         except HTTPError as error:
@@ -199,7 +217,7 @@ def request_json(
             except json.JSONDecodeError:
                 details = raw or f"HTTP {error.code}"
             raise RuntimeError(str(details)) from error
-        except (URLError, socket.gaierror) as error:
+        except (URLError, socket.gaierror, ssl.SSLError) as error:
             last_error = error
             if attempt + 1 < REQUEST_RETRY_ATTEMPTS:
                 time.sleep(REQUEST_RETRY_DELAY_SECONDS)
@@ -267,7 +285,7 @@ def request_multipart(
         method="POST",
     )
     try:
-        with urlopen(request, timeout=timeout) as response:
+        with open_https(request, timeout=timeout) as response:
             raw = response.read().decode("utf-8")
     except HTTPError as error:
         raw = error.read().decode("utf-8", errors="replace")
