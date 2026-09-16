@@ -1,11 +1,11 @@
-create table if not exists public.radarmap_subscribers (
-  chat_id text primary key,
-  username text,
-  first_name text,
-  updated_at timestamptz not null default now()
+CREATE TABLE IF NOT EXISTS public.radarmap_subscribers (
+  chat_id TEXT NOT NULL PRIMARY KEY,
+  username TEXT NULL,
+  first_name TEXT NULL,
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
-alter table public.radarmap_subscribers enable row level security;
+ALTER TABLE public.radarmap_subscribers ENABLE ROW LEVEL SECURITY;
 
 -- The bot uses the server-side service_role key from Replit Secrets.
 -- Do not expose SUPABASE_KEY in browser or mobile code.
