@@ -206,6 +206,7 @@ def supabase_request(
     *,
     query: dict[str, str] | None = None,
     body: Any = None,
+    prefer: str = "return=representation",
 ) -> Any:
     if not SUPABASE_URL or not SUPABASE_KEY:
         raise RuntimeError(
@@ -224,7 +225,7 @@ def supabase_request(
             "apikey": SUPABASE_KEY,
             "authorization": f"Bearer {SUPABASE_KEY}",
             "content-type": "application/json",
-            "prefer": "return=representation",
+            "prefer": prefer,
         },
         method=method,
     )
@@ -493,6 +494,7 @@ def save_subscribers(subscribers: list[dict[str, Any]]) -> None:
                 SUPABASE_SUBSCRIBERS_TABLE,
                 query={"on_conflict": "chat_id"},
                 body=rows,
+                prefer="resolution=merge-duplicates,return=representation",
             )
         except Exception as error:
             print(
